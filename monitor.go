@@ -60,9 +60,21 @@ func Run(cfg *Config) {
 	tick := time.NewTicker(interval)
 	defer tick.Stop()
 
-	cpuCores := runtime.NumCPU()
+	cpuCores := physicalCoreCount()
 	currentWorkers := 0
 	targetMemBytes := int64(0)
+
+	// Pin the Go runtime to physical cores. On Windows (hyperthreading),
+	// GOMAXPROCS defaults to logical CPUs; leaving it high spreads each worker
+	// across half-cores and undersaturates.
+	runtime.GOMAXPROCS(cpuCores)
+
+	var (
+		smoothedCPU  float64
+		prevWorkers  int
+		prevSmoothed float64
+		first        = true
+	)
 
 	for {
 		<-tick.C
@@ -72,43 +84,74 @@ func Run(cfg *Config) {
 			continue
 		}
 
-		// ---- CPU control ----
-		// If observed system CPU is below threshold, spin up workers; adjust in
-		// steps proportional to the error so we converge and overshoot minimally.
-		delta := int((cfg.CPUThreshold - metrics.CPUPercent) / 10)
-		next := currentWorkers + delta
-		if next < 0 {
-			next = 0
+		// ---- CPU control (band with hysteresis, smoothed + self-stalling) ----
+		// Below CPULow: ramp workers up. Above CPUHigh: release workers. Within
+		// the band: hold current load.
+		sysCPU := metrics.CPUPercent
+		if first {
+			smoothedCPU = sysCPU
+			first = false
 		}
-		if next > cpuCores {
-			next = cpuCores
-		}
-		if next != currentWorkers {
-			cpuGen.Set(next)
-			currentWorkers = next
-			tracef("cpu: sys=%.1f%% thr=%.1f%% workers=%d", metrics.CPUPercent, cfg.CPUThreshold, currentWorkers)
-		}
+		prevSmoothed = smoothedCPU
+		smoothedCPU = smoothedCPU*0.4 + sysCPU*0.6
 
-		// ---- Memory control ----
-		// Allocate so that total used memory approaches the threshold. Baseline
-		// used memory is approximated as current total minus what we hold.
+		switch {
+		case smoothedCPU < cfg.CPULow:
+			// Ramp up one worker at a time. If the last added worker did NOT
+			// raise measured CPU (scheduler saturation / hyperthread collapse),
+			// stop increasing — adding more burns cycles and can lower throughput.
+			saturated := currentWorkers > prevWorkers && smoothedCPU < prevSmoothed-4
+			if !saturated && currentWorkers < cpuCores {
+				currentWorkers++
+				cpuGen.Set(currentWorkers)
+				tracef("cpu: sys=%.1f%% below band [%.0f-%.0f] -> workers=%d", sysCPU, cfg.CPULow, cfg.CPUHigh, currentWorkers)
+			}
+		case smoothedCPU > cfg.CPUHigh:
+			// Release one worker until back inside the band.
+			if currentWorkers > 0 {
+				currentWorkers--
+				cpuGen.Set(currentWorkers)
+				tracef("cpu: sys=%.1f%% above band [%.0f-%.0f] -> workers=%d", sysCPU, cfg.CPULow, cfg.CPUHigh, currentWorkers)
+			}
+		default:
+			tracef("cpu: sys=%.1f%% within band [%.0f-%.0f] hold workers=%d", sysCPU, cfg.CPULow, cfg.CPUHigh, currentWorkers)
+		}
+		prevWorkers = currentWorkers
+
+		// ---- Memory control (band with hysteresis) ----
+		// Below MemLow: allocate so system memory reaches MemLow. Above MemHigh:
+		// release so it drops to MemHigh. Within the band: hold.
 		sysUsed := float64(int64(metrics.MemTotal)) * metrics.MemPercent / 100.0
 		baseline := sysUsed - float64(targetMemBytes)
-		thresholdBytes := float64(int64(metrics.MemTotal)) * cfg.MemThreshold / 100.0
-		desiredHold := thresholdBytes - baseline
-		if desiredHold < 0 {
-			desiredHold = 0
+		lowBytes := float64(int64(metrics.MemTotal)) * cfg.MemLow / 100.0
+		highBytes := float64(int64(metrics.MemTotal)) * cfg.MemHigh / 100.0
+
+		var newTarget int64
+		switch {
+		case sysUsed < lowBytes:
+			hold := lowBytes - baseline
+			if hold < 0 {
+				hold = 0
+			}
+			newTarget = int64(hold)
+		case sysUsed > highBytes:
+			hold := highBytes - baseline
+			if hold < 0 {
+				hold = 0
+			}
+			newTarget = int64(hold)
+		default:
+			newTarget = targetMemBytes // within band: hold
 		}
-		newTarget := int64(desiredHold) / (1 << 20) * (1 << 20) // round to MiB
-		// Damp overshoot-churn: only reallocate when moving down or by a big gap.
-		if newTarget < targetMemBytes || newTarget-targetMemBytes > (24<<20) {
+
+		if newTarget != targetMemBytes {
 			memGen.Set(newTarget)
 			targetMemBytes = newTarget
-			tracef("mem: sys=%.1f%% thr=%.1f%% hold=%d MiB", metrics.MemPercent, cfg.MemThreshold, targetMemBytes>>20)
+			tracef("mem: sys=%.1f%% band [%.0f-%.0f] hold=%d MiB", metrics.MemPercent, cfg.MemLow, cfg.MemHigh, targetMemBytes>>20)
 		}
 
 		if currentWorkers == 0 && targetMemBytes == 0 {
-			tracef("idle: cpu=%.1f%% mem=%.1f%% (at/above thresholds)", metrics.CPUPercent, metrics.MemPercent)
+			tracef("idle: cpu=%.1f%% mem=%.1f%% (within band)", metrics.CPUPercent, metrics.MemPercent)
 		}
 	}
 }
@@ -117,4 +160,14 @@ func tracef(format string, a ...interface{}) {
 	if verbose {
 		printf(format+"\n", a...)
 	}
+}
+
+// physicalCoreCount returns the number of physical cores (not logical
+// hyperthreaded processors). Falls back to the logical count when the OS
+// cannot report physical cores.
+func physicalCoreCount() int {
+	if n, err := cpu.Counts(false); err == nil && n > 0 {
+		return n
+	}
+	return runtime.NumCPU()
 }

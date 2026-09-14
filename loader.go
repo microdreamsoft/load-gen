@@ -1,12 +1,17 @@
 package main
 
 import (
+	"runtime"
 	"sync"
 )
 
-// CPUWorker is a spinning goroutine that burns CPU cycles.
+// CPUWorker is a goroutine that does real computation to burn CPU cycles,
+// pinning one core at ~100% (a bare select-spin does not saturate a core).
 type CPUWorker struct {
 	stop chan struct{}
+	// sink absorbs computed values so the compiler cannot eliminate the work;
+	// written per-worker to avoid cache-line contention between workers.
+	sink uint64
 }
 
 // Stop signals the worker to exit.
@@ -14,14 +19,26 @@ func (w *CPUWorker) Stop() {
 	close(w.stop)
 }
 
-// pump busy-loops until stopped.
+// pump busy-burns until stopped.
 func (w *CPUWorker) pump() {
+	// Lock a dedicated OS thread so the spinning load stays on a stable,
+	// single CPU rather than being migrated/reused by the scheduler. This
+	// improves saturation on Windows hyperthreaded hosts.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	x := uint64(0x9E3779B97F4A7C15)
 	for {
 		select {
 		case <-w.stop:
 			return
 		default:
-			// pure computation to consume a full core
+			for i := 0; i < 512; i++ {
+				x ^= x >> 12
+				x ^= x << 25
+				x ^= x >> 27
+				x *= 0x2545F4914F6CDD1D
+			}
+			w.sink ^= x
 		}
 	}
 }

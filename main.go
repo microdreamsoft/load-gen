@@ -29,20 +29,13 @@ func main() {
 		logOut = f
 	}
 
-	printf("load-gen v0.1 | cpu_thr=%.1f%% mem_thr=%.1f%% interval=%.1fs cores=%d (verbose=%v)",
-		cfg.CPUThreshold, cfg.MemThreshold, cfg.Interval, runtime.NumCPU(), verbose)
+	printf("load-gen v0.2 | cpu_band=[%.0f%%-%.0f%%] mem_band=[%.0f%%-%.0f%%] interval=%.1fs physical_cores=%d logical=%d (verbose=%v)",
+		cfg.CPULow, cfg.CPUHigh, cfg.MemLow, cfg.MemHigh, cfg.Interval, physicalCoreCount(), runtime.NumCPU(), verbose)
 
 	Run(cfg)
 }
 
 var vFlag = false
-
-func printUsageHeader() {
-	if !verbose {
-		return
-	}
-	fmt.Printf("load-gen resident on %d cores\n", runtime.NumCPU())
-}
 
 func sprintf(format string, a ...interface{}) string {
 	return fmt.Sprintf(format, a...)
