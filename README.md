@@ -27,6 +27,33 @@ GOOS=linux GOARCH=amd64 go build -o load-gen .
 GOOS=darwin GOARCH=arm64 go build -o load-gen .
 ```
 
+构建 Linux ARM 版本（默认 `arm64`）：
+
+```bash
+./build-linux-arm.sh
+```
+
+Windows 命令提示符或 PowerShell 可运行：
+
+```bat
+build-linux-arm.bat
+```
+
+构建 32 位 ARM 版本或指定输出路径：
+
+```bash
+GOARCH=arm ./build-linux-arm.sh
+OUTPUT=/tmp/load-gen-linux-arm64 ./build-linux-arm.sh
+```
+
+Windows 下可通过环境变量切换架构或输出路径：
+
+```bat
+set GOARCH=arm
+set OUTPUT=C:\temp\load-gen-linux-arm
+build-linux-arm.bat
+```
+
 ## 用法
 
 ```bash
